@@ -1,6 +1,6 @@
 {
   "name": "agent-skill-shelf",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Tiered skill governance (Core + On-Demand Shelf) and fast local routing for Codex, Claude Code, and Antigravity agents.",
   "type": "module",
   "bin": {

@@ -291,9 +291,104 @@ describe('agent-skill-shelf end-to-end', () => {
     assert.equal(liveRes.status, 0, liveRes.stderr);
     const firstLive = JSON.parse(liveRes.stdout.trim().split(/\r?\n/)[0]);
     assert.equal(firstLive.name, 'docker-compose-helper');
+    assert.equal(firstLive.tier, 'shelf');
+    assert.equal(firstLive.discovery, 'new');
+
+    // Auto-sync via find must also write the new skill into catalog.jsonl and Codex config.toml
+    const tomlAfterAutoSync = fs.readFileSync(path.join(userHome, '.codex', 'config.toml'), 'utf8');
+    assert.ok(tomlAfterAutoSync.includes('docker-compose-helper/SKILL.md'));
+    assert.ok(tomlAfterAutoSync.includes('max_context_tokens = 8000'));
   });
 
-  it('6. enable and disable sync skills between shelf and core without deleting sources', () => {
+  it('6. sync command is idempotent, heals Codex UI comment-stripped config, and preserves nested & multi-source skills', () => {
+    // 1. Add a nested skill and a same-name skill with DIFFERENT content across roots
+    writeSkill(
+      path.join(userHome, '.agents', 'skills', 'collection-pack', 'nested'),
+      'nested-helper',
+      '---\nname: nested-helper\ndescription: Nested skill inside a bundle directory.\n---\n'
+    );
+    writeSkill(
+      path.join(userHome, '.codex', 'skills'),
+      'dual-source-skill',
+      '---\nname: dual-source-skill\ndescription: Codex specialized version for dual source testing.\n---\n'
+    );
+    writeSkill(
+      path.join(userHome, '.agents', 'skills'),
+      'dual-source-skill',
+      '---\nname: dual-source-skill\ndescription: Shared agents alternate version for dual source testing.\n---\n'
+    );
+
+    // 2. Simulate Codex UI stripping comments & accidentally disabling Core skill with single quotes
+    const codexConfigPath = path.join(userHome, '.codex', 'config.toml');
+    const brokenToml = [
+      'model = "gpt-5"',
+      'sandbox_mode = "workspace-write"',
+      '',
+      '[skills]',
+      'max_context_tokens = 2000',
+      '',
+      '[[skills.config]]',
+      `path = '${path.join(userHome, '.codex', 'skills', 'api-design', 'SKILL.md')}'`,
+      'enabled = false',
+      '',
+    ].join('\n');
+    fs.writeFileSync(codexConfigPath, brokenToml, 'utf8');
+
+    // sync --check should detect drift and exit 1
+    const checkBefore = runCliCmd(['sync', '--check', '--user-home', userHome, '--shelf-home', shelfHome]);
+    assert.equal(checkBefore.status, 1);
+
+    // Run sync to heal config.toml, update budget to 8000, and index new skills as shelf
+    const sync1 = runCliCmd(['sync', '--json', '--codex-budget', '8000', '--user-home', userHome, '--shelf-home', shelfHome]);
+    assert.equal(sync1.status, 0, sync1.stderr);
+    const s1 = JSON.parse(sync1.stdout);
+    assert.equal(s1.newlyAdded.length, 3);
+    assert.equal(s1.codexBudget, 8000);
+    assert.equal(s1.configChanged, true);
+
+    const healedToml = fs.readFileSync(codexConfigPath, 'utf8');
+    // Strictly one [skills] section, budget 8000, Core api-design no longer disabled
+    assert.equal((healedToml.match(/^\[skills\]\s*$/gm) || []).length, 1);
+    assert.ok(healedToml.includes('max_context_tokens = 8000'));
+    assert.equal(healedToml.includes('.codex/skills/api-design/SKILL.md'), false);
+    assert.ok(healedToml.includes('nested-helper/SKILL.md'));
+    assert.ok(healedToml.includes('# AGENT_SKILL_SHELF_START'));
+
+    // Second sync must be strictly idempotent
+    const sync2 = runCliCmd(['sync', '--json', '--user-home', userHome, '--shelf-home', shelfHome]);
+    assert.equal(sync2.status, 0, sync2.stderr);
+    const s2 = JSON.parse(sync2.stdout);
+    assert.equal(s2.catalogChanged, false);
+    assert.equal(s2.configChanged, false);
+    assert.equal(s2.newlyAdded.length, 0);
+
+    const checkAfter = runCliCmd(['sync', '--check', '--user-home', userHome, '--shelf-home', shelfHome]);
+    assert.equal(checkAfter.status, 0, checkAfter.stderr);
+
+    // Search must return BOTH distinct-content copies of dual-source-skill
+    const dualRes = runCliCmd(['find', 'dual source testing', '--user-home', userHome, '--shelf-home', shelfHome]);
+    assert.equal(dualRes.status, 0, dualRes.stderr);
+    const dualHits = dualRes.stdout.trim().split(/\r?\n/).map(l => JSON.parse(l));
+    const dualMatches = dualHits.filter(h => h.name === 'dual-source-skill');
+    assert.equal(dualMatches.length, 2);
+    assert.deepEqual(dualMatches.map(m => m.source).sort(), ['agents', 'codex']);
+
+    // Budget above official 10000 cap must be rejected
+    const badBudget = runCliCmd(['sync', '--codex-budget', '20000', '--user-home', userHome, '--shelf-home', shelfHome]);
+    assert.notEqual(badBudget.status, 0);
+
+    // Reset codex config back to clean managed apply state before restore test
+    fs.writeFileSync(codexConfigPath, origConfigToml, 'utf8');
+    const cleanApply = runCliCmd([
+      'apply',
+      '--core', 'api-design,no-frontmatter-skill',
+      '--user-home', userHome,
+      '--shelf-home', shelfHome,
+    ]);
+    assert.equal(cleanApply.status, 0, cleanApply.stderr);
+  });
+
+  it('7. enable and disable sync skills between shelf and core without deleting sources', () => {
     const enRes = runCliCmd([
       'enable', 'postgres-patterns', '--user-home', userHome, '--shelf-home', shelfHome,
     ]);
@@ -330,7 +425,7 @@ describe('agent-skill-shelf end-to-end', () => {
     );
   });
 
-  it('7. doctor exits 0 with all checks passing', () => {
+  it('8. doctor exits 0 with all checks passing', () => {
     const res = runCliCmd(['doctor', '--json', '--user-home', userHome, '--shelf-home', shelfHome]);
     assert.equal(res.status, 0, res.stdout + res.stderr);
     const report = JSON.parse(res.stdout);
@@ -338,7 +433,7 @@ describe('agent-skill-shelf end-to-end', () => {
     assert.ok(report.checks.every(c => c.ok));
   });
 
-  it('8. restore cleanly removes managed configs/plugins and preserves original files verbatim', () => {
+  it('9. restore cleanly removes managed configs/plugins and preserves original files verbatim', () => {
     // Enable one skill so Claude managed copy cleanup is also exercised on restore
     const enRes = runCliCmd([
       'enable', 'postgres-patterns', '--user-home', userHome, '--shelf-home', shelfHome,

@@ -102,6 +102,11 @@ node "<REPO_DIR>/bin/skill-shelf.mjs" find "testing"
 Only report success when `doctor` exits with code `0` and all checks show `[OK]`.
 Remind the user:
 - **Codex / Antigravity / Claude Code** pick up updated configs on the next session or reload.
+- **Automatic sync for newly installed skills**:
+  - `find` runs a lightweight incremental `sync` automatically before searching, indexing new skills as `shelf` (`enabled = false` in Codex) without touching Core.
+  - Optionally schedule `node ~/.agent-skill-shelf/runtime/bin/skill-shelf.mjs sync --quiet` every 5 minutes (Windows Task Scheduler via hidden `wscript.exe` launcher, or cron/launchd on macOS/Linux) so newly installed skills stay synced even before the first `find`.
+- To adjust Codex's catalog token budget (default `8000`, official cap `10000`):
+  - `node ~/.agent-skill-shelf/runtime/bin/skill-shelf.mjs sync --codex-budget 8000`
 - To promote or demote a skill later:
   - `node ~/.agent-skill-shelf/runtime/bin/skill-shelf.mjs enable <skill-name>`
   - `node ~/.agent-skill-shelf/runtime/bin/skill-shelf.mjs disable <skill-name>`

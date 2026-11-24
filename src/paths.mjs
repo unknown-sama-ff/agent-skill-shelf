@@ -8,7 +8,16 @@ import path from 'node:path';
  * @returns {string}
  */
 export function toPosix(targetPath) {
-  return targetPath.replace(/\\/g, '/');
+  return path.resolve(targetPath).replace(/\\/g, '/');
+}
+
+/**
+ * Normalize a filesystem path into a canonical case-insensitive POSIX key.
+ * @param {string} targetPath
+ * @returns {string}
+ */
+export function normPath(targetPath) {
+  return toPosix(targetPath).toLowerCase();
 }
 
 /**
@@ -63,6 +72,8 @@ export function resolveEnvironment(options = {}) {
     catalogPath: path.join(shelfHome, 'catalog.jsonl'),
     configPath: path.join(shelfHome, 'config.json'),
     backupsDir: path.join(shelfHome, 'backups'),
+    syncLogPath: path.join(shelfHome, 'sync.log'),
+    syncLockPath: path.join(shelfHome, 'sync.lock'),
   };
 }
 

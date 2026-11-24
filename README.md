@@ -56,7 +56,7 @@ Your agent will run a read-only `audit` first, present the numbers and suggested
 
 | Host | How `apply` Works | How `restore` Works |
 | --- | --- | --- |
-| **Codex** | Appends a managed `# AGENT_SKILL_SHELF_START` block to `~/.codex/config.toml` (`enabled = false` for non-core & shadowed duplicates) + routing rule in `~/.codex/AGENTS.md` | Strips only the managed blocks; leaves all custom settings & skills intact |
+| **Codex** | Writes a managed `# AGENT_SKILL_SHELF_START` block to `~/.codex/config.toml` (`max_context_tokens = 8000` within Codex's 10,000 cap + `enabled = false` for Shelf & shadowed duplicates, self-healing stray UI-written rules) + routing rule in `~/.codex/AGENTS.md` | Strips only the managed blocks; leaves all custom settings & skills intact |
 | **Antigravity** | Creates an isolated plugin at `~/.gemini/config/plugins/skill-shelf/` with Core skill copies (auto-fixing missing frontmatter without touching originals) + `always_on` routing rule | Deletes only the `skill-shelf` plugin directory |
 | **Claude Code** | Appends a managed `<!-- AGENT_SKILL_SHELF_START -->` routing rule to `~/.claude/CLAUDE.md`; tracks only skills explicitly copied via `enable` | Removes the managed block from `CLAUDE.md` and only copies created by `skill-shelf` |
 
@@ -80,24 +80,28 @@ node bin/skill-shelf.mjs audit
 # 2. Preview deployment without writing anything
 node bin/skill-shelf.mjs apply --dry-run
 
-# 3. Deploy with auto-selected Core (default max 30) or explicit list
-node bin/skill-shelf.mjs apply --max-core 30
+# 3. Deploy with auto-selected Core (default max 30) or explicit list & Codex budget (default 8000, cap 10000)
+node bin/skill-shelf.mjs apply --max-core 30 --codex-budget 8000
 node bin/skill-shelf.mjs apply --hosts codex,antigravity --core "api-design,python-testing"
 
-# 4. Search the shelf (works with English keywords, Chinese phrases, and newly added disk skills)
+# 4. Incrementally sync newly installed skills into Shelf + Codex config (idempotent, safe for cron / Task Scheduler)
+node bin/skill-shelf.mjs sync
+node bin/skill-shelf.mjs sync --check
+
+# 5. Auto-sync & search the shelf (English, Chinese, multi-source aware, marks newly discovered skills)
 node bin/skill-shelf.mjs find "postgres migration"
 
-# 5. Promote / demote skills between Core and Shelf
+# 6. Promote / demote skills between Core and Shelf
 node bin/skill-shelf.mjs enable postgres-patterns
 node bin/skill-shelf.mjs disable postgres-patterns
 node bin/skill-shelf.mjs list
 
-# 6. Export/import custom bilingual search tags
+# 7. Export/import custom bilingual search tags
 node bin/skill-shelf.mjs tags --export --out skills.json
 node bin/skill-shelf.mjs tags --set postgres-patterns "postgres,postgresql,数据库,迁移"
 node bin/skill-shelf.mjs tags --import tags.json
 
-# 7. Health check & clean rollback
+# 8. Health check (including sync drift & Codex budget checks) & clean rollback
 node bin/skill-shelf.mjs doctor
 node bin/skill-shelf.mjs restore --purge-home
 ```

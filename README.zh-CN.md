@@ -56,7 +56,7 @@
 
 | 宿主 | `apply` 行为 | `restore` 还原方式 |
 | --- | --- | --- |
-| **Codex** | 在 `~/.codex/config.toml` 写入带标记的 `# AGENT_SKILL_SHELF_START` 托管块（为非核心及重复副本写入 `enabled = false`），并在 `~/.codex/AGENTS.md` 注入路由规则 | 仅剥离托管标记块，完整保留原有配置与全部技能文件 |
+| **Codex** | 在 `~/.codex/config.toml` 写入带标记的 `# AGENT_SKILL_SHELF_START` 托管块（自动设置合理预算 `max_context_tokens = 8000`，为非核心及重复副本写入 `enabled = false`，并自动自愈 UI 剥离注释后的游离规则），同时在 `~/.codex/AGENTS.md` 注入路由规则 | 仅剥离托管标记块，完整保留原有配置与全部技能文件 |
 | **Antigravity** | 生成可独立开关的插件 `~/.gemini/config/plugins/skill-shelf/`，仅同步 Core 技能副本（自动补齐缺失的 frontmatter，不改源文件）并注入 `always_on` 路由规则 | 直接删除 `skill-shelf` 插件目录即可 |
 | **Claude Code** | 在 `~/.claude/CLAUDE.md` 注入按需路由块，并仅追踪由 `skill-shelf enable` 跨目录复制进来的技能副本 | 移除 `CLAUDE.md` 托管块，仅清理工具创建的副本，绝不碰用户原有技能 |
 
@@ -80,24 +80,28 @@ node bin/skill-shelf.mjs audit
 # 2. 预览部署效果（不写任何文件）
 node bin/skill-shelf.mjs apply --dry-run
 
-# 3. 执行部署（自动精选 Core 或显式指定 Core 列表）
-node bin/skill-shelf.mjs apply --max-core 30
+# 3. 执行部署（自动精选 Core 或显式指定 Core 列表，可选指定 Codex 预算，默认 8000，官方上限 10000）
+node bin/skill-shelf.mjs apply --max-core 30 --codex-budget 8000
 node bin/skill-shelf.mjs apply --hosts codex,antigravity --core "api-design,python-testing"
 
-# 4. 本地检索（支持英文词边界、BM25 权重、中文标签及磁盘新增技能实时发现）
+# 4. 增量同步磁盘新增技能到 Shelf 与 Codex 禁用规则（幂等、适合定时任务后台每 5 分钟运行）
+node bin/skill-shelf.mjs sync
+node bin/skill-shelf.mjs sync --check
+
+# 5. 本地检索（检索前自动轻量同步新增技能，区分 core/shelf/new 并保留同名异内容多来源）
 node bin/skill-shelf.mjs find "数据库迁移"
 
-# 5. 动态切换某个技能的常驻 / 按需状态
+# 6. 动态切换某个技能的常驻 / 按需状态
 node bin/skill-shelf.mjs enable postgres-patterns
 node bin/skill-shelf.mjs disable postgres-patterns
 node bin/skill-shelf.mjs list
 
-# 6. 导出/导入中英文检索标签
+# 7. 导出/导入中英文检索标签
 node bin/skill-shelf.mjs tags --export --out skills.json
 node bin/skill-shelf.mjs tags --set postgres-patterns "postgres,postgresql,数据库,迁移"
 node bin/skill-shelf.mjs tags --import tags.json
 
-# 7. 环境自检与无损回滚
+# 8. 环境自检（含同步漂移与 Codex 预算检查）与无损回滚
 node bin/skill-shelf.mjs doctor
 node bin/skill-shelf.mjs restore --purge-home
 ```

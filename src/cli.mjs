@@ -4,16 +4,19 @@ import {
   applyAntigravity,
   applyClaude,
   applyCodex,
+  DEFAULT_CODEX_BUDGET,
   installRuntime,
   loadShelfConfig,
   REPO_ROOT,
+  resolveCodexBudget,
   restoreAntigravity,
   restoreClaude,
   restoreCodex,
   runDoctorChecks,
   saveShelfConfig,
+  syncShelfIncremental,
 } from './hosts.mjs';
-import { detectHosts, resolveEnvironment } from './paths.mjs';
+import { detectHosts, normPath, resolveEnvironment } from './paths.mjs';
 import { scanSkillSources, suggestCoreSkills } from './scanner.mjs';
 import {
   buildCatalogRows,
@@ -34,12 +37,16 @@ function parseArgs(argv) {
       flags.help = true;
     } else if (arg === '--version' || arg === '-v') {
       flags.version = true;
+    } else if (arg === '-q' || arg === '--quiet') {
+      flags.quiet = true;
     } else if (
       arg === '--json' ||
       arg === '--pretty' ||
       arg === '--dry-run' ||
       arg === '--purge-home' ||
-      arg === '--export'
+      arg === '--export' ||
+      arg === '--no-sync' ||
+      arg === '--check'
     ) {
       flags[arg.slice(2)] = true;
     } else if (arg.startsWith('--') && i + 1 < argv.length) {
@@ -54,9 +61,9 @@ function parseArgs(argv) {
 function getPackageVersion() {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8'));
-    return pkg.version || '0.1.0';
+    return pkg.version || '0.2.0';
   } catch {
-    return '0.1.0';
+    return '0.2.0';
   }
 }
 
@@ -70,13 +77,14 @@ Usage:
 Commands:
   audit                      Read-only scan of installed hosts, skills, duplicates, and savings
   apply                      Configure Core + On-Demand Shelf across detected or selected hosts
-  find "<query>"             Search the shelf and newly dropped local skills (BM25 + CJK tags)
+  sync                       Incrementally index newly installed skills into Shelf and sync Codex config
+  find "<query>"             Auto-sync & search the shelf (BM25 + CJK tags + multi-source aware)
   enable <name>              Promote a skill from the On-Demand Shelf into Core
   disable <name>             Demote a Core skill back to the On-Demand Shelf
   list                       Show Core and Shelf counts and skill names
   tags --export | --import   Export skill metadata or import bilingual search tags JSON
   tags --set <name> <t1,t2>  Set comma-separated search tags for a skill
-  doctor                     Verify runtime, catalog, and host integrations
+  doctor                     Verify runtime, catalog, sync drift, and host integrations
   restore                    Remove managed host blocks/plugins and restore original configs
 
 Common Options:
@@ -86,6 +94,10 @@ Common Options:
   --core <a,b,c>             Comma-separated Core skill names for apply
   --core-file <path>         File containing Core skill names (one per line or JSON array)
   --max-core <n>             Max auto-selected Core skills when --core is omitted (default: 30)
+  --codex-budget <n>         Codex [skills].max_context_tokens (default: 8000, max: 10000)
+  --no-sync                  Skip automatic incremental sync before find
+  --check                    With sync: dry-run and exit 1 if catalog or config drift is detected
+  --quiet, -q                Suppress routine sync output
   --dry-run                  Preview mutations without writing files
   --json                     Output machine-readable JSON
   -h, --help                 Show this help message
@@ -136,6 +148,11 @@ function parseCoreSelection(flags, scanResult) {
 
 function syncHostsAndCatalog(env, scanResult, hosts, coreSkills, options = {}) {
   const coreSet = new Set(coreSkills);
+  const prevConfig = loadShelfConfig(env);
+  const codexBudget = resolveCodexBudget(
+    options.codexBudget !== undefined ? options.codexBudget : prevConfig?.codexBudget,
+    DEFAULT_CODEX_BUDGET
+  );
   const existingCatalog = loadCatalog(env.shelfHome);
   const catalogRows = buildCatalogRows(scanResult, coreSet, existingCatalog);
 
@@ -147,13 +164,15 @@ function syncHostsAndCatalog(env, scanResult, hosts, coreSkills, options = {}) {
     saveCatalog(env.shelfHome, catalogRows);
   }
 
-  const prevConfig = loadShelfConfig(env);
   let claudeManagedCopies = prevConfig?.claudeManagedCopies || [];
+  const prevManagedKey = JSON.stringify([...claudeManagedCopies].sort());
   const hostResults = [];
 
   for (const host of hosts) {
     if (host === 'codex') {
-      hostResults.push(applyCodex(env, scanResult, coreSet, { ...options, backupDir }));
+      hostResults.push(
+        applyCodex(env, scanResult, coreSet, { ...options, backupDir, codexBudget })
+      );
     } else if (host === 'antigravity') {
       hostResults.push(applyAntigravity(env, scanResult, coreSet, options));
     } else if (host === 'claude') {
@@ -167,10 +186,18 @@ function syncHostsAndCatalog(env, scanResult, hosts, coreSkills, options = {}) {
     }
   }
 
+  let finalCatalogRows = catalogRows;
+  if (!options.dryRun && JSON.stringify([...claudeManagedCopies].sort()) !== prevManagedKey) {
+    const postScan = scanSkillSources(env);
+    finalCatalogRows = buildCatalogRows(postScan, coreSet, catalogRows);
+    saveCatalog(env.shelfHome, finalCatalogRows);
+  }
+
   const nextConfig = {
-    version: 1,
+    version: 2,
     hosts,
     coreSkills: [...coreSet].sort(),
+    codexBudget,
     claudeManagedCopies,
     updatedAt: new Date().toISOString(),
   };
@@ -182,9 +209,11 @@ function syncHostsAndCatalog(env, scanResult, hosts, coreSkills, options = {}) {
   return {
     dryRun: Boolean(options.dryRun),
     hosts,
+    codexBudget,
     coreCount: nextConfig.coreSkills.length,
-    shelfCount: catalogRows.length - nextConfig.coreSkills.length,
-    totalUniqueSkills: catalogRows.length,
+    shelfCount: finalCatalogRows.filter(r => r.tier !== 'core').length,
+    totalCatalogEntries: finalCatalogRows.length,
+    totalUniqueSkills: scanResult.uniqueCount,
     backupDir: options.dryRun ? null : backupDir,
     hostResults,
   };
@@ -259,6 +288,7 @@ function cmdApply(env, flags) {
   const coreSkills = parseCoreSelection(flags, scan);
   const result = syncHostsAndCatalog(env, scan, hosts, coreSkills, {
     dryRun: Boolean(flags['dry-run']),
+    codexBudget: flags['codex-budget'],
   });
 
   if (flags.json) {
@@ -267,47 +297,81 @@ function cmdApply(env, flags) {
   }
 
   console.log(
-    `${result.dryRun ? '[DRY-RUN] ' : ''}Applied agent-skill-shelf: hosts=[${result.hosts.join(', ')}], core=${result.coreCount}, shelf=${result.shelfCount}`
+    `${result.dryRun ? '[DRY-RUN] ' : ''}Applied agent-skill-shelf: hosts=[${result.hosts.join(', ')}], core=${result.coreCount}, shelf=${result.shelfCount}, codexBudget=${result.codexBudget}`
   );
   if (result.backupDir) {
     console.log(`Backups saved to: ${result.backupDir}`);
   }
 }
 
-function buildLiveSearchRows(env) {
+function cmdSync(env, flags) {
+  const dryRun = Boolean(flags['dry-run'] || flags.check);
+  const res = syncShelfIncremental(env, {
+    dryRun,
+    codexBudget: flags['codex-budget'],
+  });
+
+  if (!res.initialized) {
+    throw new Error(`Shelf is not initialized at ${env.configPath}. Run "skill-shelf apply" first.`);
+  }
+
+  if (flags.json) {
+    console.log(JSON.stringify({ ...res, newlyAddedPaths: undefined }, null, 2));
+  } else if (!flags.quiet) {
+    console.log(
+      `${res.dryRun ? '[DRY-RUN] ' : ''}Synced skill-shelf: total=${res.totalCatalog}, core=${res.coreCount}, shelf=${res.shelfCount}, added=${res.newlyAdded.length}, stale=${res.stalePaths.length}, catalogChanged=${res.catalogChanged}, configChanged=${res.configChanged}`
+    );
+  }
+
+  if (flags.check && (res.catalogChanged || res.configChanged || res.newlyAdded.length > 0)) {
+    process.exitCode = 1;
+  }
+}
+
+function buildLiveSearchRows(env, options = {}) {
+  let newlyAddedPaths = new Set();
+
+  if (!options.noSync && fs.existsSync(env.configPath)) {
+    const syncRes = syncShelfIncremental(env, { dryRun: false });
+    if (syncRes?.newlyAddedPaths) {
+      newlyAddedPaths = syncRes.newlyAddedPaths;
+    }
+  }
+
   const savedRows = loadCatalog(env.shelfHome);
+  if (!options.noSync && savedRows.length > 0 && fs.existsSync(env.configPath)) {
+    return { rows: savedRows, newlyAddedPaths };
+  }
+
   const cfg = loadShelfConfig(env);
   const coreSet = new Set(cfg?.coreSkills || []);
   const scan = scanSkillSources(env);
 
-  if (scan.uniqueCount === 0 && savedRows.length > 0) {
-    return savedRows;
+  if (scan.entries.length === 0 && savedRows.length > 0) {
+    return { rows: savedRows, newlyAddedPaths };
   }
 
-  const savedByName = new Map(savedRows.map(r => [r.name, r]));
-  return scan.uniqueList.map(entry => {
-    const prev = savedByName.get(entry.name);
-    return {
-      name: entry.name,
-      tier: prev?.tier || (coreSet.has(entry.name) ? 'core' : 'shelf'),
-      source: entry.source,
-      path: entry.path,
-      description: entry.description,
-      tags: prev?.tags || [],
-    };
-  });
+  const savedByPath = new Map(savedRows.filter(r => r?.path).map(r => [normPath(r.path), r]));
+  const rows = buildCatalogRows(scan, coreSet, savedRows);
+  for (const r of rows) {
+    if (!savedByPath.has(normPath(r.path))) {
+      newlyAddedPaths.add(normPath(r.path));
+    }
+  }
+  return { rows, newlyAddedPaths };
 }
 
 function cmdFind(env, flags, positional) {
   const query = positional.join(' ').trim();
   if (!query) {
-    throw new Error('Usage: skill-shelf find "<keywords>" [--limit N] [--tier all|core|shelf]');
+    throw new Error('Usage: skill-shelf find "<keywords>" [--limit N] [--tier all|core|shelf|new] [--no-sync]');
   }
   const limit = flags.limit !== undefined ? parseInt(flags.limit, 10) : 5;
-  const rows = buildLiveSearchRows(env);
+  const { rows, newlyAddedPaths } = buildLiveSearchRows(env, { noSync: Boolean(flags['no-sync']) });
   const results = searchSkills(rows, query, {
     limit: Number.isNaN(limit) ? 5 : limit,
     tier: flags.tier || 'all',
+    newlyAddedPaths,
   });
 
   if (flags.pretty) {
@@ -345,7 +409,7 @@ function cmdToggle(env, flags, positional, enable) {
   if (enable) coreSet.add(skillName);
   else coreSet.delete(skillName);
 
-  const syncOptions = {};
+  const syncOptions = { codexBudget: flags['codex-budget'] };
   if (enable && hosts.includes('claude')) {
     syncOptions.promoteSkillToClaude = skillName;
   }
@@ -362,7 +426,7 @@ function cmdToggle(env, flags, positional, enable) {
 }
 
 function cmdList(env, flags) {
-  const rows = buildLiveSearchRows(env);
+  const { rows } = buildLiveSearchRows(env, { noSync: Boolean(flags['no-sync']) });
   const tier = flags.tier || 'all';
   const filtered = tier === 'all' ? rows : rows.filter(r => r.tier === tier);
   const core = rows.filter(r => r.tier === 'core').map(r => r.name);
@@ -372,7 +436,7 @@ function cmdList(env, flags) {
     console.log(
       JSON.stringify(
         {
-          totalUnique: rows.length,
+          totalEntries: rows.length,
           coreCount: core.length,
           shelfCount: shelf.length,
           items: filtered,
@@ -390,14 +454,20 @@ function cmdList(env, flags) {
 }
 
 function cmdTags(env, flags, positional) {
-  const rows = buildLiveSearchRows(env);
+  const { rows } = buildLiveSearchRows(env, { noSync: true });
 
   if (flags.export) {
-    const payload = rows.map(r => ({
-      name: r.name,
-      description: r.description,
-      tags: r.tags || [],
-    }));
+    const seen = new Set();
+    const payload = [];
+    for (const r of rows) {
+      if (seen.has(r.name)) continue;
+      seen.add(r.name);
+      payload.push({
+        name: r.name,
+        description: r.description,
+        tags: r.tags || [],
+      });
+    }
     const serialized = `${JSON.stringify(payload, null, 2)}\n`;
     if (flags.out) {
       const outPath = path.resolve(flags.out);
@@ -443,11 +513,13 @@ function cmdTags(env, flags, positional) {
     const skillName = flags.set;
     const rawTags = positional[0] || '';
     const tags = normalizeTags(rawTags.split(','));
-    const target = rows.find(r => r.name === skillName);
-    if (!target) {
+    const matches = rows.filter(r => r.name === skillName);
+    if (matches.length === 0) {
       throw new Error(`Skill "${skillName}" not found in local catalog.`);
     }
-    target.tags = tags;
+    for (const target of matches) {
+      target.tags = tags;
+    }
     saveCatalog(env.shelfHome, rows);
     console.log(JSON.stringify({ action: 'set-tags', name: skillName, tags }));
     return;
@@ -532,6 +604,9 @@ export function runCli(argv) {
       break;
     case 'apply':
       cmdApply(env, flags);
+      break;
+    case 'sync':
+      cmdSync(env, flags);
       break;
     case 'find':
       cmdFind(env, flags, rest);
